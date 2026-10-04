@@ -227,6 +227,85 @@ def smoke_tests():
           status == 200 and fv.get("kind") == "length" and fv.get("offset") == 3,
           f"{status} {fv}")
 
+    # --- scenario E: four continuous KeyUpdates; low epoch tag wraps ------
+    # epochs 3 and 7 both carry E=3 in the unified header. The first
+    # application-data record of epoch 7 must be attributed to epoch 7, not
+    # dropped as a duplicate capture of the same-tag initial epoch.
+    chain = [secret3]
+    for _ in range(4):
+        chain.append(ratchet_secret(chain[-1]))
+    import hashlib as _hashlib
+    telemetry = b"first-telemetry-after-rotation"
+    telemetry_digest = _hashlib.sha256(telemetry).hexdigest()
+    ku_initial = key_update_record(chain[0], 3, 0)
+    forged = bytearray(seal_record(chain[4], 7, 1, b"forged", 23))
+    forged[-1] ^= 0x01
+    records = [
+        ku_initial,                                  # epoch 3 seq 0 -> epoch 4
+        key_update_record(chain[1], 4, 0),           # -> epoch 5
+        key_update_record(chain[2], 5, 0),           # -> epoch 6
+        key_update_record(chain[3], 6, 0),           # -> epoch 7
+        seal_record(chain[4], 7, 0, telemetry, 23),  # tag 3 == epoch 3's tag
+        bytes(ku_initial),                           # true replay, epoch 3
+        seal_record(chain[0], 3, 7, b"late-e3", 23), # unseen straggler, epoch 3
+        seal_record(chain[4], 7, 0, telemetry, 23),  # exact replay, epoch 7
+        bytes(forged),                               # forged under the shared tag
+    ]
+    status, v = post_audit("smoke-rotation", secret_hex, records)
+    ok = status == 200 and v.get("ok") is False  # the forged record is a violation
+    check("rotation: submission adjudicated", ok,
+          f"{status} {json.dumps(v)[:300]}" if not ok else "")
+    if status == 200:
+        recs = v["records"]
+        check("rotation: four KeyUpdates processed in order",
+              [recs[i]["key_update"] for i in range(4)] == ["processed"] * 4
+              and all(recs[i]["auth"] == "ok" for i in range(4)))
+        check("rotation: current epoch is 7 after four ratchets",
+              v["final_state"]["current_epoch"] == 7
+              and v["final_state"]["ratchets"] == 4)
+        fresh = recs[4]
+        check("rotation: first telemetry attributed to epoch 7",
+              fresh["epoch"] == 7 and fresh["seq"] == 0,
+              f"epoch={fresh['epoch']} seq={fresh['seq']}")
+        check("rotation: telemetry is new and authenticated",
+              fresh["replay"] == "new" and fresh["auth"] == "ok",
+              f"replay={fresh['replay']} auth={fresh['auth']}")
+        check("rotation: application-data digest returned",
+              fresh["app_data_sha256"] == telemetry_digest
+              and fresh["inner_type"] == "application_data",
+              str(fresh.get("app_data_sha256")))
+        win_after = fresh.get("window_after") or {}
+        check("rotation: epoch 7 window advanced by the record",
+              win_after.get("epoch") == 7 and win_after.get("highest") == 0
+              and win_after.get("bitmap") == "0000000000000001",
+              str(win_after))
+        check("rotation: same-tag old capture stays an epoch-3 duplicate",
+              recs[5]["epoch"] == 3 and recs[5]["replay"] == "duplicate")
+        check("rotation: old-epoch straggler adjudicated on epoch 3",
+              recs[6]["epoch"] == 3 and recs[6]["replay"] == "new"
+              and recs[6]["auth"] == "ok")
+        check("rotation: replay of the epoch-7 telemetry is a duplicate",
+              recs[7]["epoch"] == 7 and recs[7]["replay"] == "duplicate")
+        check("rotation: forged record fails authentication at the tag",
+              viol(recs[8]).get("kind") == "authentication"
+              and viol(recs[8]).get("offset") == len(records[8]) - 16)
+        epoch_windows = {e["epoch"]: e for e in v["final_state"]["epochs"]}
+        check("rotation: epoch 7 window records only the genuine telemetry",
+              epoch_windows[7]["highest"] == 0
+              and epoch_windows[7]["bitmap"] == "0000000000000001"
+              and epoch_windows[3]["highest"] == 7,
+              json.dumps(epoch_windows))
+        fv = v.get("first_violation") or {}
+        check("rotation: first violation is the forged record only",
+              fv.get("record_index") == 8 and fv.get("kind") == "authentication")
+    status, v2 = http("GET", "/api/audit/smoke-rotation")
+    check("rotation: frozen verdict reopens with the same attribution",
+          status == 200 and (v2 or {}).get("final_state", {})
+          .get("current_epoch") == 7
+          and v2["records"][4]["epoch"] == 7
+          and v2["records"][4]["app_data_sha256"] == telemetry_digest,
+          f"status {status}")
+
 
 def main():
     print(f"[verify] acceptance run, target {APP_BASE}")

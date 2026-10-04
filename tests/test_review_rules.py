@@ -274,5 +274,146 @@ class ReceiverRuleTests(unittest.TestCase):
         self.assertIsNone(row["inner_type"])
 
 
+def ratchet_chain(secret, count):
+    chain = [secret]
+    for _ in range(count):
+        chain.append(ratchet_secret(chain[-1]))
+    return chain
+
+
+class EpochTagWraparoundTests(unittest.TestCase):
+    """Low two-bit epoch tag repeats every four KeyUpdates (RFC 9147 §4.1).
+
+    A fresh record in the newest epoch must not be dropped as a replay of a
+    same-tag record in an epoch four generations earlier; attribution is by
+    AEAD verification.
+    """
+
+    def _rotate(self, rx, chain, times, start_epoch=3, first_seq=0):
+        for i in range(times):
+            epoch = start_epoch + i
+            seq = first_seq if i == 0 else 0  # later epochs start with a reset window
+            row = rx.process_record(
+                key_update_record(chain[i], epoch, seq))
+            self.assertEqual(row["key_update"], "processed")
+            self.assertEqual(row["auth"], "ok")
+
+    def test_four_ratchets_first_appdata_in_newest_epoch(self):
+        chain = ratchet_chain(SECRET3, 4)
+        rx = Receiver(3, chain[0])
+        self._rotate(rx, chain, 4)
+        self.assertEqual(rx.current.epoch, 7)  # tag 7&3 == 3, same as epoch 3
+        row = rx.process_record(appdata(chain[4], 7, 0, b"post-rotation"))
+        self.assertEqual((row["epoch"], row["seq"]), (7, 0))
+        self.assertEqual((row["replay"], row["auth"]), ("new", "ok"))
+        self.assertEqual(row["inner_type"], "application_data")
+        self.assertEqual(row["app_data_sha256"],
+                         hashlib.sha256(b"post-rotation").hexdigest())
+        # the newest epoch's own window advanced exactly once
+        self.assertEqual(rx.current.window.highest, 0)
+        self.assertEqual(rx.current.window.bitmap, 1)
+
+    def test_same_tag_old_epoch_replay_still_duplicate(self):
+        chain = ratchet_chain(SECRET3, 4)
+        rx = Receiver(3, chain[0])
+        old_rec = appdata(chain[0], 3, 0, b"first")
+        rx.process_record(old_rec)
+        self._rotate(rx, chain, 4, first_seq=1)
+        # a genuinely new epoch-7 record comes in first ...
+        rx.process_record(appdata(chain[4], 7, 0, b"new-epoch"))
+        # ... then the old epoch-3 capture with the identical tag is replayed
+        row = rx.process_record(old_rec)
+        self.assertEqual(row["epoch"], 3)
+        self.assertEqual(row["replay"], "duplicate")
+        self.assertEqual(rx.current.epoch, 7)
+        self.assertEqual(rx.current.window.highest, 0)  # no slide on replay
+
+    def test_same_tag_old_epoch_straggler_accepted_then_replayed(self):
+        chain = ratchet_chain(SECRET3, 4)
+        rx = Receiver(3, chain[0])
+        self._rotate(rx, chain, 4)
+        late = appdata(chain[0], 3, 9, b"late")  # unseen seq in old epoch
+        row = rx.process_record(late)
+        self.assertEqual((row["epoch"], row["replay"], row["auth"]),
+                         (3, "new", "ok"))
+        self.assertEqual(rx.current.window.highest, -1)  # current untouched
+        replay = rx.process_record(late)
+        self.assertEqual((replay["epoch"], replay["replay"]), (3, "duplicate"))
+
+    def test_old_epoch_key_update_under_collision_ignored(self):
+        chain = ratchet_chain(SECRET3, 4)
+        rx = Receiver(3, chain[0])
+        self._rotate(rx, chain, 4)
+        row = rx.process_record(key_update_record(chain[0], 3, 2))
+        self.assertEqual(row["epoch"], 3)
+        self.assertEqual(row["auth"], "ok")
+        self.assertEqual(row["key_update"], "ignored_old_epoch")
+        self.assertEqual(rx.current.epoch, 7)
+        self.assertEqual(rx.ratchets, 4)
+
+    def test_too_old_record_in_old_epoch_under_collision(self):
+        chain = ratchet_chain(SECRET3, 4)
+        rx = Receiver(3, chain[0])
+        rx.process_record(appdata(chain[0], 3, 64, b"hi"))
+        self._rotate(rx, chain, 4, first_seq=65)
+        row = rx.process_record(appdata(chain[0], 3, 0, b"hi"))
+        self.assertEqual(row["epoch"], 3)
+        self.assertEqual(row["replay"], "too_old")
+        self.assertIsNone(row["violation"])
+        self.assertEqual(rx.current.window.highest, -1)
+
+    def test_forged_record_under_ambiguous_tag_fails_and_does_not_advance(self):
+        chain = ratchet_chain(SECRET3, 4)
+        rx = Receiver(3, chain[0])
+        self._rotate(rx, chain, 4)
+        forged = bytearray(appdata(chain[4], 7, 0, b"fake"))
+        forged[-1] ^= 0x01
+        row = rx.process_record(bytes(forged))
+        self.assertEqual(row["violation"]["kind"], "authentication")
+        self.assertEqual(row["violation"]["offset"], len(forged) - 16)
+        self.assertEqual(rx.current.window.highest, -1)
+        # the genuine record still comes through afterwards
+        good = rx.process_record(appdata(chain[4], 7, 0, b"fake"))
+        self.assertEqual((good["epoch"], good["replay"], good["auth"]),
+                         (7, "new", "ok"))
+
+    def test_forged_key_update_under_ambiguous_tag_never_ratchets(self):
+        chain = ratchet_chain(SECRET3, 4)
+        rx = Receiver(3, chain[0])
+        self._rotate(rx, chain, 4)
+        forged = bytearray(key_update_record(chain[4], 7, 0, request_update=1))
+        forged[-1] ^= 0xFF
+        row = rx.process_record(bytes(forged))
+        self.assertEqual(row["violation"]["kind"], "authentication")
+        self.assertEqual(rx.current.epoch, 7)
+        self.assertEqual(rx.ratchets, 4)
+
+    def test_eight_ratchets_record_attributed_to_newest(self):
+        chain = ratchet_chain(SECRET3, 8)
+        rx = Receiver(3, chain[0])
+        self._rotate(rx, chain, 8)
+        self.assertEqual(rx.current.epoch, 11)  # tag 3 shared by 3, 7, 11
+        row = rx.process_record(appdata(chain[8], 11, 0, b"far"))
+        self.assertEqual((row["epoch"], row["replay"], row["auth"]),
+                         (11, "new", "ok"))
+        # a straggler in the middle epoch 7 also resolves correctly
+        mid = rx.process_record(appdata(chain[4], 7, 3, b"mid"))
+        self.assertEqual((mid["epoch"], mid["replay"], mid["auth"]),
+                         (7, "new", "ok"))
+
+    def test_ratchet_through_collision_keeps_rotation_going(self):
+        chain = ratchet_chain(SECRET3, 5)
+        rx = Receiver(3, chain[0])
+        self._rotate(rx, chain, 4)  # 3 -> 7
+        # fifth KeyUpdate lives in epoch 7 whose tag collides with epoch 3
+        row = rx.process_record(key_update_record(chain[4], 7, 1))
+        self.assertEqual(row["key_update"], "processed")
+        self.assertEqual(rx.current.epoch, 8)
+        self.assertEqual(rx.ratchets, 5)
+        nxt = rx.process_record(appdata(chain[5], 8, 0, b"e8"))
+        self.assertEqual((nxt["epoch"], nxt["replay"], nxt["auth"]),
+                         (8, "new", "ok"))
+
+
 if __name__ == "__main__":
     unittest.main()

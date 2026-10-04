@@ -11,6 +11,13 @@ adjudicates every record as new / duplicate / too_old. A legal KeyUpdate is
 authenticated first and only then ratchets the secret into the next epoch and
 resets the receive window. Failed, duplicate, or old-epoch records never
 advance secrets or the current window.
+
+The unified header carries only the low two bits of the epoch, so once four
+KeyUpdates have happened two retained epochs share a tag (e.g. epochs 3 and 7
+both send E=3). Such records are attributed by AEAD verification across every
+epoch matching the tag: the ciphertext authenticates under exactly one epoch
+key, never under another, so a fresh record in the newest epoch is not
+mistaken for a same-tag replay in an older epoch (or vice versa).
 """
 from __future__ import annotations
 
@@ -251,15 +258,14 @@ class Receiver:
         self.epoch_history: list[EpochState] = [self.current]
         self.ratchets = 0
 
-    def _epoch_for_bits(self, bits: int) -> EpochState | None:
-        for state in self.epoch_history:
-            if bits == (state.epoch & 0x03):
-                return state
-        if bits == (self.current.epoch & 0x03):
-            return self.current
-        if self.previous is not None and bits == (self.previous.epoch & 0x03):
-            return self.previous
-        return None
+    def _epochs_for_bits(self, bits: int) -> list[EpochState]:
+        """All retained epochs whose low two header bits equal ``bits``.
+
+        Newest first: when epochs share a tag after a wraparound the record is
+        attributed by AEAD verification, starting at the newest candidate.
+        """
+        return [s for s in reversed(self.epoch_history)
+                if bits == (s.epoch & 0x03)]
 
     def _ratchet(self) -> None:
         """Derive the next epoch's keys and reset its receive window."""
@@ -298,41 +304,77 @@ class Receiver:
                 "declared_length": hdr.declared_length,
                 "header_length": hdr.header_len,
             }
-            state = self._epoch_for_bits(hdr.epoch_bits)
-            if state is None:
+            candidates = self._epochs_for_bits(hdr.epoch_bits)
+            if not candidates:
                 raise Violation(
                     KIND_STATE, 0,
                     f"epoch bits {hdr.epoch_bits} match neither current epoch "
                     f"{self.current.epoch} nor a retained previous epoch",
                 )
-            row["epoch"] = state.epoch
-            seq = reconstruct_seq(state.window.highest, hdr.seq_truncated, hdr.seq_nbits)
-            row["seq"] = seq
-            replay = state.window.classify(seq)
-            row["replay"] = replay
-            row["window_before"] = state.window.snapshot(state.epoch)
-            if replay != "new":
-                # Duplicate / expired records are dropped before decryption and
-                # never advance secrets or windows.
-                row["auth"] = "skipped"
-                return row
             ciphertext = data[hdr.header_len:]
-            if len(ciphertext) < TAG_LEN:
-                raise Violation(
-                    KIND_LENGTH, hdr.header_len,
-                    f"ciphertext of {len(ciphertext)} byte(s) cannot hold a "
-                    f"16-byte AEAD tag",
-                )
-            plaintext = aead_open(state.key, state.iv, seq,
-                                  data[:hdr.header_len], ciphertext)
-            if plaintext is None:
-                raise Violation(KIND_AUTHENTICATION, len(data) - TAG_LEN,
-                                "AEAD tag verification failed")
-            row["auth"] = "ok"
-            # Authenticated: mark the replay window, then unwrap the inner type.
-            state.window.advance(seq)
-            row["window_after"] = state.window.snapshot(state.epoch)
-            self._unwrap_inner(row, state, hdr, plaintext)
+            if len(candidates) == 1:
+                # Unique tag: the replay check can gate decryption as usual.
+                state = candidates[0]
+                seq = reconstruct_seq(state.window.highest, hdr.seq_truncated,
+                                      hdr.seq_nbits)
+                row["epoch"] = state.epoch
+                row["seq"] = seq
+                replay = state.window.classify(seq)
+                row["replay"] = replay
+                row["window_before"] = state.window.snapshot(state.epoch)
+                if replay != "new":
+                    # Duplicate / expired records are dropped before decryption and
+                    # never advance secrets or windows.
+                    row["auth"] = "skipped"
+                    return row
+                if len(ciphertext) < TAG_LEN:
+                    raise Violation(
+                        KIND_LENGTH, hdr.header_len,
+                        f"ciphertext of {len(ciphertext)} byte(s) cannot hold a "
+                        f"16-byte AEAD tag",
+                    )
+                plaintext = aead_open(state.key, state.iv, seq,
+                                      data[:hdr.header_len], ciphertext)
+                if plaintext is None:
+                    raise Violation(KIND_AUTHENTICATION, len(data) - TAG_LEN,
+                                    "AEAD tag verification failed")
+                row["auth"] = "ok"
+                state.window.advance(seq)
+                row["window_after"] = state.window.snapshot(state.epoch)
+                self._unwrap_inner(row, state, hdr, plaintext)
+            else:
+                # Several retained epochs share the low two-bit tag (the tag has
+                # wrapped after four KeyUpdates). Sequence numbers alone cannot
+                # tell a fresh record in the newest epoch from a same-tag
+                # replay in an older one, so attribute the record by AEAD
+                # verification: the ciphertext opens under exactly one key.
+                if len(ciphertext) < TAG_LEN:
+                    raise Violation(
+                        KIND_LENGTH, hdr.header_len,
+                        f"ciphertext of {len(ciphertext)} byte(s) cannot hold a "
+                        f"16-byte AEAD tag",
+                    )
+                state, seq, plaintext = self._authenticate_candidate(
+                    candidates, hdr, data, ciphertext)
+                if state is None:
+                    raise Violation(
+                        KIND_AUTHENTICATION, len(data) - TAG_LEN,
+                        "AEAD tag verification failed under every retained "
+                        "epoch matching the header epoch bits",
+                    )
+                row["epoch"] = state.epoch
+                row["seq"] = seq
+                row["auth"] = "ok"
+                replay = state.window.classify(seq)
+                row["replay"] = replay
+                row["window_before"] = state.window.snapshot(state.epoch)
+                if replay != "new":
+                    # A genuine same-tag capture replayed in an older epoch:
+                    # authenticated above, but still dropped and never advanced.
+                    return row
+                state.window.advance(seq)
+                row["window_after"] = state.window.snapshot(state.epoch)
+                self._unwrap_inner(row, state, hdr, plaintext)
         except Violation as v:
             row["violation"] = v.as_dict()
         finally:
@@ -340,6 +382,28 @@ class Receiver:
                     and row["window_after"] is None):
                 row["window_after"] = state.window.snapshot(state.epoch)
         return row
+
+    def _authenticate_candidate(
+        self,
+        candidates: list[EpochState],
+        hdr: UnifiedHeader,
+        data: bytes,
+        ciphertext: bytes,
+    ) -> tuple[EpochState | None, int | None, bytes | None]:
+        """Trial-open a record under every same-tag epoch, newest first.
+
+        Each candidate reconstructs the full sequence number with its own
+        receive window; returns the unique epoch under which the AEAD tag
+        verifies, or (None, None, None) if none of the keys authenticates it.
+        """
+        aad = data[:hdr.header_len]
+        for cand in candidates:
+            seq = reconstruct_seq(cand.window.highest, hdr.seq_truncated,
+                                  hdr.seq_nbits)
+            plaintext = aead_open(cand.key, cand.iv, seq, aad, ciphertext)
+            if plaintext is not None:
+                return cand, seq, plaintext
+        return None, None, None
 
     def _unwrap_inner(self, row: dict, state: EpochState,
                       hdr: UnifiedHeader, plaintext: bytes) -> None:
