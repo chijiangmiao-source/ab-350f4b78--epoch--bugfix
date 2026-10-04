@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: relay-audit-app
+    ports:
+      # host port is configurable: HOST_PORT=9000 docker compose up app
+      - "${HOST_PORT:-8080}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    build: .
+    image: relay-audit-app
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_URL: http://app:8000
+    command: ["python", "verify.py"]
+    restart: "no"

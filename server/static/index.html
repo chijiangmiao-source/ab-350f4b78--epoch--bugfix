@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>深空中继 · DTLS 1.3 遥测审计台</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #0b1020; color: #dbe4ff; margin: 0; }
+  header { padding: 16px 24px; border-bottom: 1px solid #26314f; }
+  h1 { font-size: 19px; margin: 0; }
+  h1 small { color: #8fa3d0; font-weight: normal; font-size: 12.5px; margin-left: 10px; }
+  main { display: flex; gap: 18px; padding: 18px 24px; flex-wrap: wrap; }
+  .panel { background: #121a30; border: 1px solid #26314f; border-radius: 10px;
+           padding: 14px 16px; flex: 1; min-width: 360px; }
+  .panel h2 { font-size: 14px; margin: 0 0 8px; color: #9db4e8; }
+  .panel p.hint { font-size: 11.5px; color: #6f80ab; margin: 4px 0 0; }
+  label { display: block; font-size: 12px; color: #8fa3d0; margin: 10px 0 4px; }
+  input, textarea { width: 100%; background: #0b1226; color: #dbe4ff;
+                    border: 1px solid #33406b; border-radius: 6px; padding: 8px;
+                    font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  textarea { min-height: 150px; resize: vertical; }
+  button { margin-top: 12px; background: #2f6fed; color: #fff; border: 0;
+           border-radius: 6px; padding: 9px 18px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #3f7dfd; }
+  #error { color: #ff9090; font-size: 12px; margin-top: 10px; white-space: pre-wrap; }
+  #result { margin: 0 24px 24px; }
+  .banner { border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; font-size: 13.5px; }
+  .banner.ok  { background: #0f2f1e; border: 1px solid #1f7a4d; color: #8ff0b8; }
+  .banner.bad { background: #33131c; border: 1px solid #aa3355; color: #ffb3c0; }
+  .final { font-size: 12px; color: #9db4e8; margin-bottom: 12px;
+           font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 11.5px;
+          font-family: ui-monospace, Consolas, monospace; }
+  th, td { border: 1px solid #26314f; padding: 5px 7px; text-align: left;
+           vertical-align: top; }
+  th { background: #182242; color: #9db4e8; }
+  tr.violation td { background: #2a1420; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+  .tag.new  { background: #0f2f1e; color: #8ff0b8; }
+  .tag.dup  { background: #33260f; color: #ffd27a; }
+  .tag.old  { background: #2a2a33; color: #aaaaaa; }
+  .tag.fail { background: #33131c; color: #ffb3c0; }
+  .tag.skip { background: #1a1f2e; color: #7f8db3; }
+  .tag.okb  { background: #0f2f1e; color: #8ff0b8; }
+</style>
+</head>
+<body>
+<header>
+  <h1>深空中继遥测审计台
+    <small>DTLS 1.3 · 无 CID 统一头 · TLS_AES_128_GCM_SHA256 · 单方向 · 每 epoch 64 位重放窗口</small>
+  </h1>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>提交捕获记录</h2>
+    <label for="audit_id">审计标识</label>
+    <input id="audit_id" maxlength="64" placeholder="例如 relay-2026-10-04-a" value="relay-001">
+    <label for="initial_epoch">初始接收 epoch</label>
+    <input id="initial_epoch" type="number" min="0" max="65535" value="3">
+    <label for="traffic_secret">Traffic Secret（32 字节，64 位十六进制）</label>
+    <input id="traffic_secret" maxlength="64" placeholder="00112233…eeff" spellcheck="false">
+    <label for="records">捕获记录（每行一条 Base64，按捕获顺序，至多 48 条）</label>
+    <textarea id="records" spellcheck="false" placeholder="KwABAC…"></textarea>
+    <button id="submit">提交并冻结裁决</button>
+    <p class="hint">服务仅依据所给 traffic secret 派生各 epoch 密钥；重复、过期、
+      认证失败或伪造 KeyUpdate 的记录不会推进秘密或窗口。</p>
+  </section>
+
+  <section class="panel">
+    <h2>重新打开冻结裁决</h2>
+    <label for="reopen_id">审计标识</label>
+    <input id="reopen_id" maxlength="64" placeholder="relay-001">
+    <button id="reopen">打开冻结裁决</button>
+    <p class="hint">裁决在提交时冻结于服务端；同一审计标识再次提交会原子替换旧裁决，
+      旧成功证据随之清除。</p>
+    <div id="error"></div>
+  </section>
+</main>
+
+<section id="result" hidden>
+  <div style="padding:0 0 10px">
+    <h2 style="font-size:15px;color:#9db4e8">冻结裁决 · <span id="v-audit"></span>
+      <small id="v-created" style="color:#6f80ab;font-weight:normal"></small></h2>
+  </div>
+  <div id="v-banner" class="banner"></div>
+  <div id="v-final" class="final"></div>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>原始长度</th><th>头部 (S/L/E/截断序号)</th><th>epoch</th>
+          <th>完整序号</th><th>重放裁定</th><th>认证</th><th>内部类型</th>
+          <th>应用数据摘要 (SHA-256)</th><th>重放窗口 前 → 后</th><th>违规（类型 @ 原始偏移）</th>
+        </tr>
+      </thead>
+      <tbody id="v-rows"></tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const KIND_ZH = {truncation: "截断", length: "长度", authentication: "认证", state: "状态"};
+const REPLAY_ZH = {new: "新到", duplicate: "重复", too_old: "过旧"};
+const AUTH_ZH = {ok: "通过", failed: "失败", skipped: "跳过"};
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g,
+    c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+}
+
+// 渲染新结果前清空旧成功证据
+function clearResult() {
+  $("result").hidden = true;
+  $("v-banner").className = "banner";
+  $("v-banner").textContent = "";
+  $("v-final").textContent = "";
+  $("v-rows").innerHTML = "";
+  $("v-audit").textContent = "";
+  $("v-created").textContent = "";
+}
+
+function showError(msg) {
+  clearResult();
+  $("error").textContent = msg;
+}
+
+function winText(w) {
+  if (!w) return "—";
+  return `e${w.epoch} 最高${w.highest} 0x${w.bitmap}`;
+}
+
+function renderVerdict(v) {
+  clearResult();
+  $("error").textContent = "";
+  $("v-audit").textContent = v.audit_id;
+  $("v-created").textContent = "冻结于 " + v.created_at;
+  const banner = $("v-banner");
+  if (v.ok) {
+    banner.className = "banner ok";
+    banner.textContent = `裁决：全部 ${v.record_count} 条记录通过认证与重放检查，未发现违规。`;
+  } else {
+    const f = v.first_violation;
+    banner.className = "banner bad";
+    banner.textContent = `裁决：存在违规。首个违规 — 记录 #${f.record_index} · ` +
+      `${KIND_ZH[f.kind] || f.kind}违规 · 原始偏移 ${f.offset} · ${f.message}` +
+      `（该次旧成功证据已清除）`;
+  }
+  const fs = v.final_state;
+  $("v-final").textContent =
+    `当前 epoch：${fs.current_epoch} · KeyUpdate 推进次数：${fs.ratchets}\n` +
+    fs.epochs.map(e =>
+      `epoch ${e.epoch}（${e.role === "current" ? "当前" : "上一"}）：` +
+      `最高序号 ${e.highest} · 位图 0x${e.bitmap}`).join("\n");
+  const rows = v.records.map(r => {
+    const hdr = r.header
+      ? `S${r.header.s_bit ? 1 : 0} L${r.header.l_bit ? 1 : 0} ` +
+        `E${r.header.epoch_bits} seq截断=${r.header.seq_truncated}`
+      : "—";
+    const replay = r.replay
+      ? `<span class="tag ${r.replay === "new" ? "new" : r.replay === "duplicate" ? "dup" : "old"}">${REPLAY_ZH[r.replay]}</span>`
+      : "—";
+    const auth = r.auth
+      ? `<span class="tag ${r.auth === "ok" ? "okb" : r.auth === "failed" ? "fail" : "skip"}">${AUTH_ZH[r.auth]}</span>`
+      : "—";
+    let inner = r.inner_type ? esc(r.inner_type) : "—";
+    if (r.key_update === "processed") inner += " · KeyUpdate✔已推进";
+    if (r.key_update === "ignored_old_epoch") inner += " · KeyUpdate✘旧epoch忽略";
+    const digest = r.app_data_sha256
+      ? `<span title="${r.app_data_sha256}">${r.app_data_sha256.slice(0, 16)}…</span>（${r.inner_length}B）`
+      : "—";
+    const win = (r.window_before || r.window_after)
+      ? `${esc(winText(r.window_before))}<br>→ ${esc(winText(r.window_after))}`
+      : "—";
+    const viol = r.violation
+      ? `${KIND_ZH[r.violation.kind] || r.violation.kind} @${r.violation.offset}：${esc(r.violation.message)}`
+      : "—";
+    return `<tr class="${r.violation ? "violation" : ""}">` +
+      `<td>${r.index}</td><td>${r.raw_length}</td><td>${esc(hdr)}</td>` +
+      `<td>${r.epoch ?? "—"}</td><td>${r.seq ?? "—"}</td>` +
+      `<td>${replay}</td><td>${auth}</td><td>${inner}</td>` +
+      `<td>${digest}</td><td>${win}</td><td>${viol}</td></tr>`;
+  }).join("");
+  $("v-rows").innerHTML = rows;
+  $("result").hidden = false;
+  $("result").scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+async function submitAudit() {
+  $("error").textContent = "";
+  const lines = $("records").value.split("\n")
+    .map(s => s.trim()).filter(s => s.length > 0);
+  if (lines.length < 1 || lines.length > 48) {
+    showError("记录条数须为 1–48 条。");
+    return;
+  }
+  const payload = {
+    audit_id: $("audit_id").value.trim(),
+    initial_epoch: Number($("initial_epoch").value),
+    traffic_secret: $("traffic_secret").value.trim(),
+    records: lines,
+  };
+  let resp;
+  try {
+    resp = await fetch("/api/audit", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    showError("网络错误：" + e);
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    showError("提交被拒绝：" +
+      (data && data.detail ? JSON.stringify(data.detail) : resp.status));
+    return;
+  }
+  renderVerdict(data);
+}
+
+async function reopenAudit() {
+  $("error").textContent = "";
+  const id = $("reopen_id").value.trim();
+  if (!id) { showError("请输入审计标识。"); return; }
+  let resp;
+  try {
+    resp = await fetch("/api/audit/" + encodeURIComponent(id));
+  } catch (e) {
+    showError("网络错误：" + e);
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    showError("无法打开裁决：" + (data && data.detail ? data.detail : resp.status));
+    return;
+  }
+  renderVerdict(data);
+}
+
+$("submit").addEventListener("click", submitAudit);
+$("reopen").addEventListener("click", reopenAudit);
+</script>
+</body>
+</html>
