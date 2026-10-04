@@ -251,15 +251,17 @@ class Receiver:
         self.epoch_history: list[EpochState] = [self.current]
         self.ratchets = 0
 
-    def _epoch_for_bits(self, bits: int) -> EpochState | None:
-        for state in self.epoch_history:
-            if bits == (state.epoch & 0x03):
-                return state
-        if bits == (self.current.epoch & 0x03):
-            return self.current
-        if self.previous is not None and bits == (self.previous.epoch & 0x03):
-            return self.previous
-        return None
+    def _candidate_epochs(self, bits: int) -> list[EpochState]:
+        """Retained epochs whose truncated 2-bit label matches, newest first.
+
+        The unified header carries only epoch & 0x03, so after four or more
+        consecutive KeyUpdates several retained epochs share the same label
+        (e.g. epoch 0 and epoch 4 both send E=00). The header alone cannot
+        tell them apart; the tie is broken by AEAD verification, trying the
+        current epoch first and walking back through history.
+        """
+        return [state for state in reversed(self.epoch_history)
+                if bits == (state.epoch & 0x03)]
 
     def _ratchet(self) -> None:
         """Derive the next epoch's keys and reset its receive window."""
@@ -298,36 +300,76 @@ class Receiver:
                 "declared_length": hdr.declared_length,
                 "header_length": hdr.header_len,
             }
-            state = self._epoch_for_bits(hdr.epoch_bits)
-            if state is None:
+            candidates = self._candidate_epochs(hdr.epoch_bits)
+            if not candidates:
                 raise Violation(
                     KIND_STATE, 0,
                     f"epoch bits {hdr.epoch_bits} match neither current epoch "
                     f"{self.current.epoch} nor a retained previous epoch",
                 )
-            row["epoch"] = state.epoch
-            seq = reconstruct_seq(state.window.highest, hdr.seq_truncated, hdr.seq_nbits)
-            row["seq"] = seq
-            replay = state.window.classify(seq)
-            row["replay"] = replay
-            row["window_before"] = state.window.snapshot(state.epoch)
-            if replay != "new":
-                # Duplicate / expired records are dropped before decryption and
-                # never advance secrets or windows.
-                row["auth"] = "skipped"
-                return row
             ciphertext = data[hdr.header_len:]
             if len(ciphertext) < TAG_LEN:
+                state = candidates[0]
+                row["window_before"] = state.window.snapshot(state.epoch)
                 raise Violation(
                     KIND_LENGTH, hdr.header_len,
                     f"ciphertext of {len(ciphertext)} byte(s) cannot hold a "
                     f"16-byte AEAD tag",
                 )
-            plaintext = aead_open(state.key, state.iv, seq,
-                                  data[:hdr.header_len], ciphertext)
-            if plaintext is None:
-                raise Violation(KIND_AUTHENTICATION, len(data) - TAG_LEN,
-                                "AEAD tag verification failed")
+            if len(candidates) == 1:
+                # Unambiguous epoch label: replay adjudication may skip
+                # decryption of duplicates and expired records entirely.
+                state = candidates[0]
+                row["epoch"] = state.epoch
+                seq = reconstruct_seq(state.window.highest, hdr.seq_truncated,
+                                      hdr.seq_nbits)
+                row["seq"] = seq
+                replay = state.window.classify(seq)
+                row["replay"] = replay
+                row["window_before"] = state.window.snapshot(state.epoch)
+                if replay != "new":
+                    # Duplicate / expired records are dropped before decryption
+                    # and never advance secrets or windows.
+                    row["auth"] = "skipped"
+                    return row
+                plaintext = aead_open(state.key, state.iv, seq,
+                                      data[:hdr.header_len], ciphertext)
+                if plaintext is None:
+                    raise Violation(KIND_AUTHENTICATION, len(data) - TAG_LEN,
+                                    "AEAD tag verification failed")
+            else:
+                # Several retained epochs share the same low 2-bit epoch label
+                # (e.g. epochs 0 and 4 both send E=00 after four consecutive
+                # KeyUpdates). The header cannot disambiguate them, so AEAD
+                # verification identifies the true epoch, trying the current
+                # epoch first and walking back through retained history.
+                authenticated = None
+                for candidate in candidates:
+                    cand_seq = reconstruct_seq(candidate.window.highest,
+                                               hdr.seq_truncated, hdr.seq_nbits)
+                    cand_plain = aead_open(candidate.key, candidate.iv, cand_seq,
+                                           data[:hdr.header_len], ciphertext)
+                    if cand_plain is not None:
+                        authenticated = (candidate, cand_seq, cand_plain)
+                        break
+                if authenticated is None:
+                    state = candidates[0]
+                    row["window_before"] = state.window.snapshot(state.epoch)
+                    raise Violation(KIND_AUTHENTICATION, len(data) - TAG_LEN,
+                                    "AEAD tag verification failed under every "
+                                    "epoch sharing this epoch label")
+                state, seq, plaintext = authenticated
+                row["epoch"] = state.epoch
+                row["seq"] = seq
+                replay = state.window.classify(seq)
+                row["replay"] = replay
+                row["window_before"] = state.window.snapshot(state.epoch)
+                if replay != "new":
+                    # An authentic replayed capture from an older epoch that
+                    # shares the current epoch's low label stays attributed to
+                    # its own epoch and is still dropped without unwrapping.
+                    row["auth"] = "skipped"
+                    return row
             row["auth"] = "ok"
             # Authenticated: mark the replay window, then unwrap the inner type.
             state.window.advance(seq)

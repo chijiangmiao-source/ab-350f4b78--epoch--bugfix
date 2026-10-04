@@ -12,6 +12,7 @@ Exits 0 when every check passes, 1 otherwise, so `docker compose up
 """
 import base64
 import compileall
+import hashlib
 import json
 import os
 import sys
@@ -226,6 +227,77 @@ def smoke_tests():
     check("length: kind and raw offset reported",
           status == 200 and fv.get("kind") == "length" and fv.get("offset") == 3,
           f"{status} {fv}")
+
+    # --- scenario E: four consecutive KeyUpdates wrap the 2-bit epoch label ---
+    # Initial epoch 0: after four authenticated KeyUpdates the current epoch
+    # is 4, whose header label E=00 repeats the initial epoch's label. The
+    # first seq-0 application record of the new epoch must be attributed to
+    # epoch 4, not dropped as a duplicate capture of epoch 0.
+    wrap_secret = bytes(range(32))
+    wrap_secrets = [wrap_secret]
+    wrap_records = []
+    for epoch in range(4):
+        wrap_records.append(
+            key_update_record(wrap_secrets[-1], epoch, 0, request_update=0))
+        wrap_secrets.append(ratchet_secret(wrap_secrets[-1]))
+    telemetry = b"first-telemetry-after-four-rotations"
+    wrap_records.append(
+        seal_record(wrap_secrets[4], 4, 0, telemetry, 23))
+    status, v = post_audit("smoke-wrap-rotation", wrap_secret.hex(),
+                           wrap_records, initial_epoch=0)
+    ok = status == 200 and v.get("ok") is True
+    check("wrap: submission accepted without violations", ok,
+          f"{status} {json.dumps(v)[:300]}" if not ok else "")
+    if status == 200:
+        recs = v["records"]
+        check("wrap: all four KeyUpdates processed",
+              all(r["key_update"] == "processed" and r["auth"] == "ok"
+                  for r in recs[:4]))
+        check("wrap: current epoch advanced exactly four times",
+              v["final_state"]["current_epoch"] == 4
+              and v["final_state"]["ratchets"] == 4)
+        last = recs[4]
+        check("wrap: new record attributed to the newest epoch",
+              last["epoch"] == 4 and last["seq"] == 0,
+              json.dumps({"epoch": last["epoch"], "seq": last["seq"]}))
+        check("wrap: new record adjudicated new and authenticated",
+              last["replay"] == "new" and last["auth"] == "ok"
+              and last["inner_type"] == "application_data")
+        check("wrap: application data digest returned",
+              last["app_data_sha256"] == hashlib.sha256(telemetry).hexdigest())
+        check("wrap: newest epoch window advanced for seq 0",
+              last["window_after"]["epoch"] == 4
+              and last["window_after"]["highest"] == 0
+              and last["window_after"]["bitmap"] == "0000000000000001")
+        epochs = {e["epoch"]: e for e in v["final_state"]["epochs"]}
+        check("wrap: initial epoch window untouched by the new record",
+              epochs[0]["highest"] == 0 and epochs[0]["bitmap"]
+              == "0000000000000001")
+    status, v2 = http("GET", "/api/audit/smoke-wrap-rotation")
+    check("wrap: frozen verdict reopens with correct attribution",
+          status == 200 and v2.get("records", [{}])[-1].get("epoch") == 4
+          and v2.get("records", [{}])[-1].get("replay") == "new",
+          f"status {status}")
+
+    # A genuine replay carrying the same low label but encrypted under the
+    # initial epoch's keys must stay attributed to that epoch as a duplicate.
+    historical_replay = seal_record(wrap_secrets[0], 0, 0,
+                                    b"epoch-zero-capture", 23)
+    status, v = post_audit("smoke-wrap-replay", wrap_secret.hex(),
+                           wrap_records + [historical_replay], initial_epoch=0)
+    if status != 200:
+        check("wrap-replay: submission accepted", False, f"status {status}")
+    else:
+        recs = v["records"]
+        check("wrap-replay: same-label historical capture stays in epoch 0",
+              recs[5]["epoch"] == 0 and recs[5]["replay"] == "duplicate"
+              and recs[5]["auth"] == "skipped")
+        epochs = {e["epoch"]: e for e in v["final_state"]["epochs"]}
+        check("wrap-replay: neither epoch window moved",
+              epochs[0]["highest"] == 0 and epochs[4]["highest"] == 0
+              and epochs[0]["bitmap"] == "0000000000000001"
+              and epochs[4]["bitmap"] == "0000000000000001")
+        check("wrap-replay: duplicates are not violations", v.get("ok") is True)
 
 
 def main():

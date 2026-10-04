@@ -12,6 +12,7 @@ from server.dtls import (
     Violation,
     parse_unified_header,
     reconstruct_seq,
+    run_audit,
 )
 from server.encode import key_update_record, seal_record
 
@@ -230,6 +231,137 @@ class ReceiverRuleTests(unittest.TestCase):
         rx.process_record(key_update_record(SECRET3, 3, 1))  # -> epoch 4
         row = rx.process_record(rec)  # replayed old-epoch capture
         self.assertEqual(row["replay"], "duplicate")
+
+
+class EpochLabelWrapTests(unittest.TestCase):
+    """After >= 4 ratchets the 2-bit epoch label repeats (e.g. epochs 0 and 4
+    both carry E=00); the receiving epoch is then identified cryptographically.
+    """
+
+    def _rotate(self, n, initial_epoch=0, secret=SECRET3):
+        secrets = [secret]
+        records = []
+        for epoch in range(initial_epoch, initial_epoch + n):
+            records.append(key_update_record(secrets[-1], epoch, 0))
+            secrets.append(ratchet_secret(secrets[-1]))
+        return secrets, records
+
+    def test_four_ratchets_then_seq_zero_belongs_to_newest_epoch(self):
+        secrets, records = self._rotate(4)
+        payload = b"first-telemetry-after-rotation"
+        records.append(appdata(secrets[4], 4, 0, payload))
+        verdict = run_audit(0, SECRET3, records)
+        self.assertTrue(verdict["ok"], verdict.get("first_violation"))
+        last = verdict["records"][-1]
+        self.assertEqual(last["epoch"], 4)
+        self.assertEqual(last["seq"], 0)
+        self.assertEqual(last["replay"], "new")
+        self.assertEqual(last["auth"], "ok")
+        self.assertEqual(last["inner_type"], "application_data")
+        self.assertEqual(last["app_data_sha256"],
+                         hashlib.sha256(payload).hexdigest())
+        window = {e["epoch"]: e for e in verdict["final_state"]["epochs"]}
+        self.assertEqual((window[4]["highest"], window[4]["bitmap"]), (0, "0000000000000001"))
+        self.assertEqual(verdict["final_state"]["current_epoch"], 4)
+        self.assertEqual(verdict["final_state"]["ratchets"], 4)
+
+    def test_wrapped_label_record_is_not_misread_as_old_epoch_duplicate(self):
+        secrets, records = self._rotate(4)
+        # epoch 0 saw seq 0 (its KeyUpdate); the epoch-4 seq 0 record shares
+        # the same truncated label E=00 and truncated seq 0, yet must arrive.
+        records.append(appdata(secrets[4], 4, 0, b"new"))
+        rows = run_audit(0, SECRET3, records)["records"]
+        self.assertNotEqual(rows[-1]["replay"], "duplicate")
+        self.assertIsNotNone(rows[-1]["auth"], "ok")
+
+    def test_same_label_historical_replay_stays_in_old_epoch(self):
+        secrets, records = self._rotate(4)
+        historical = appdata(secrets[0], 0, 5, b"late-capture")  # new, epoch 0
+        records.append(historical)
+        verdict = run_audit(0, SECRET3, records)
+        self.assertEqual(verdict["records"][-1]["epoch"], 0)
+        # replaying the very same capture after the label has wrapped
+        verdict = run_audit(0, SECRET3, records + [historical])
+        last = verdict["records"][-1]
+        self.assertEqual((last["epoch"], last["replay"], last["auth"]),
+                         (0, "duplicate", "skipped"))
+
+    def test_same_label_old_epoch_straggler_updates_only_its_own_window(self):
+        secrets, records = self._rotate(4)
+        records.append(appdata(secrets[4], 4, 0, b"e4"))   # newest epoch first
+        verdict = run_audit(0, SECRET3,
+                            records + [appdata(secrets[0], 0, 9, b"e0-late")])
+        last = verdict["records"][-1]
+        self.assertEqual((last["epoch"], last["replay"], last["auth"]),
+                         (0, "new", "ok"))
+        window = {e["epoch"]: e for e in verdict["final_state"]["epochs"]}
+        self.assertEqual(window[0]["highest"], 9)
+        self.assertEqual(window[4]["highest"], 0)
+
+    def test_same_label_old_epoch_key_update_ignored(self):
+        secrets, records = self._rotate(4)
+        late_ku = key_update_record(secrets[0], 0, 3)
+        verdict = run_audit(0, SECRET3, records + [late_ku])
+        last = verdict["records"][-1]
+        self.assertEqual(last["epoch"], 0)
+        self.assertEqual(last["key_update"], "ignored_old_epoch")
+        self.assertEqual(verdict["final_state"]["current_epoch"], 4)
+        self.assertEqual(verdict["final_state"]["ratchets"], 4)
+
+    def test_authentication_failure_on_ambiguous_label_advances_nothing(self):
+        secrets, records = self._rotate(4)
+        forged = bytearray(appdata(secrets[4], 4, 0, b"e4"))
+        forged[-1] ^= 0x01
+        verdict = run_audit(0, SECRET3, records + [bytes(forged)])
+        last = verdict["records"][-1]
+        self.assertEqual(last["violation"]["kind"], "authentication")
+        self.assertEqual(last["violation"]["offset"], len(forged) - 16)
+        self.assertEqual(last["window_before"], last["window_after"])
+        self.assertEqual(verdict["final_state"]["current_epoch"], 4)
+        # the genuine record still arrives afterwards
+        verdict = run_audit(0, SECRET3,
+                            records + [appdata(secrets[4], 4, 0, b"e4")])
+        self.assertTrue(verdict["ok"])
+
+    def test_forged_key_update_after_wrap_never_ratchets(self):
+        secrets, records = self._rotate(4)
+        forged = bytearray(key_update_record(secrets[4], 4, 0))
+        forged[-1] ^= 0xAA
+        verdict = run_audit(0, SECRET3, records + [bytes(forged)])
+        self.assertEqual(verdict["records"][-1]["violation"]["kind"],
+                         "authentication")
+        self.assertEqual(verdict["final_state"]["current_epoch"], 4)
+        self.assertEqual(verdict["final_state"]["ratchets"], 4)
+
+    def test_too_old_record_under_wrapped_label(self):
+        secrets, records = self._rotate(4)
+        records.append(appdata(secrets[4], 4, 0, b"e4-0"))
+        records.append(appdata(secrets[4], 4, 64, b"e4-64"))
+        replay0 = appdata(secrets[4], 4, 0, b"e4-0")
+        verdict = run_audit(0, SECRET3, records + [replay0])
+        self.assertEqual((verdict["records"][-1]["epoch"],
+                          verdict["records"][-1]["replay"]), (4, "too_old"))
+
+    def test_longer_rotation_twice_wrapped_label(self):
+        secrets, records = self._rotate(8)  # epoch 8 shares E=00 with 0 and 4
+        records.append(appdata(secrets[8], 8, 0, b"e8"))
+        verdict = run_audit(0, SECRET3, records)
+        self.assertTrue(verdict["ok"])
+        last = verdict["records"][-1]
+        self.assertEqual((last["epoch"], last["replay"], last["auth"]),
+                         (8, "new", "ok"))
+        self.assertEqual(verdict["final_state"]["current_epoch"], 8)
+        self.assertEqual(verdict["final_state"]["ratchets"], 8)
+
+    def test_four_ratchets_from_nonzero_initial_epoch(self):
+        # initial epoch 3 -> current epoch 7; both carry the label E=11.
+        secrets, records = self._rotate(4, initial_epoch=3)
+        records.append(appdata(secrets[4], 7, 0, b"e7"))
+        verdict = run_audit(3, SECRET3, records)
+        self.assertTrue(verdict["ok"])
+        last = verdict["records"][-1]
+        self.assertEqual((last["epoch"], last["replay"], last["auth"]),
+                         (7, "new", "ok"))
 
     def test_future_epoch_rejected_as_state_violation(self):
         rx = Receiver(3, SECRET3)
